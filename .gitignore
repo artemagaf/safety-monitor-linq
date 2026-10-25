@@ -15,6 +15,7 @@ models/*
 !models/ppe.onnx
 !models/world_hands.pt
 !models/yolo11n.pt
+!models/yolo11n.onnx
 !models/yolo11n-pose.pt
 # CLIP (огонь, ~340 МБ) скачивается сам при первом запуске в models/weights/clip
 

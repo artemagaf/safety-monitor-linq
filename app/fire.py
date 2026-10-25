@@ -50,6 +50,29 @@ def _load(weights_dir: str):
         return _model
 
 
+_loader: threading.Thread | None = None
+_loader_lock = threading.Lock()   # отдельный: _load_lock занят всё время скачивания
+
+
+def _load_in_background(weights_dir: str) -> bool:
+    """True — модель готова. Иначе запускает загрузку в фоне (первый запуск скачивает ~340 МБ)
+    и возвращает False: камеры работают без огня, пока веса не скачаются, а не стоят."""
+    global _loader
+    if _model is not None:
+        return True
+    with _loader_lock:
+        if _loader is None:
+            def run():
+                try:
+                    _load(weights_dir)
+                    log.info("CLIP загружен — распознавание огня включено")
+                except Exception as e:   # нет интернета и т. п. — остальное работает
+                    log.warning("CLIP не загрузился, огонь не распознаётся: %s", e)
+            _loader = threading.Thread(target=run, daemon=True, name="clip-load")
+            _loader.start()
+    return False
+
+
 class FireDetector:
     def __init__(self, cfg: dict | None = None):
         c = cfg or {}
@@ -77,6 +100,8 @@ class FireDetector:
 
     def detect(self, frame, t: float | None = None) -> list[Detection]:
         t = time.time() if t is None else t
+        if not _load_in_background(self.weights_dir):
+            return []
         if abs(t - self._last_t) < self.interval:
             return [Detection(d.box, d.conf, d.cls, "fire") for d in self._last]
         self._last_t = t
