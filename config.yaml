@@ -1,0 +1,247 @@
+# Конфигурация сервиса контроля нарушений промышленной безопасности.
+# Координаты зон задаются в долях кадра (0..1), поэтому не зависят от разрешения камеры.
+
+model:
+  backend: composite          # ultralytics | onnx | linq | composite (несколько моделей на кадре)
+  path: models/ppe.pt         # для backend: ultralytics / onnx
+  parts:
+    # 1. обученная модель СИЗ (tools/train.py, датасет Construction-PPE): люди, каски, жилеты, очки
+    - backend: ultralytics
+      path: models/ppe.pt
+      only: [person, helmet, no_helmet, vest, glasses, no_glasses]
+    # 2. YOLO-World с фиксированными классами: перчатка, голая рука, сигарета, огонь, коробка, страховочная привязь.
+    #    Датасет СИЗ снят на стройках, руки у станков там почти не встречаются — эта модель закрывает пробел.
+    - backend: ultralytics
+      path: models/world_hands.pt
+      only: [glove, bare hand, cigarette, cardboard box, safety harness]   # огонь — отдельно, CLIP (раздел fire)
+      rename: {glove: gloves, bare hand: bare_hand, cardboard box: box, safety harness: harness}
+    # 3. стандартная YOLO11n (датасет COCO, без дообучения): телефон, техника и люди в любой позе
+    - backend: ultralytics
+      path: models/yolo11n.pt
+      only: [person, cell phone, car, truck, bus, motorcycle]   # person — лежащего человека видит только она
+      rename: {cell phone: phone, car: vehicle, truck: vehicle, bus: vehicle, motorcycle: vehicle}
+    # 4. «второй взгляд»: та же YOLO-World на вырезке головы и рук каждого человека — мелкие предметы
+    #    (сигарета) на целом кадре теряются при уменьшении до 640 точек. Должна идти последней.
+    - backend: ultralytics
+      path: models/world_hands.pt
+      only: [cigarette]
+      conf: 0.2
+      zoom: {top: 0.0, bottom: 0.45, widen: 0.15, max_persons: 4, min_height: 120}
+  imgsz: 640
+  conf: 0.3                   # порог уверенности детекции
+  iou: 0.5                    # порог NMS
+  device: cpu
+  # Имена классов модели -> роли, с которыми работают правила.
+  # Ключи сравниваются без учёта регистра. Классы, которых здесь нет, игнорируются.
+  class_map:
+    person: person
+    hardhat: helmet
+    helmet: helmet
+    no-hardhat: no_helmet
+    no_helmet: no_helmet
+    safety vest: vest
+    vest: vest
+    no-safety vest: no_vest
+    no_vest: no_vest
+    mask: mask
+    no-mask: no_mask
+    no_mask: no_mask
+    cigarette: cigarette
+    glasses: glasses
+    no_glasses: no_glasses
+    gloves: gloves
+    bare_hand: bare_hand
+    phone: phone
+    vehicle: vehicle
+    fire: fire
+    box: box
+    harness: harness
+
+linq:
+  runtime_module: pytpu       # Python API LinQ TPU (есть на стенде hackathon.lin-q.ru)
+  model_path: models/ppe_head.tpu   # программа для TPU (tools/compile_linq.py compile)
+                                    # на стенде Jupyter: /auto/cache/<ЛОГИН>/ppe_head.tpu
+  head_onnx: models/ppe_head.onnx   # часть сети на TPU: имя входа и выходов
+  tail_onnx: models/ppe_tail.onnx   # хвост головы YOLO на CPU (null, если модель компилировалась целиком)
+  names_from: models/ppe.onnx       # исходная модель: имена классов
+  device_id: 0                # номер из pytpu.Device.list_devices()
+  fallback: onnx              # если LinQ недоступен — на чём работать (null = падать с ошибкой)
+  fallback_path: models/yolo11n.onnx
+
+rules:
+  ppe_mode: negative          # negative — нарушение, только если модель увидела "NO-каска";
+                              # absence  — нарушение, если каска не найдена на человеке
+  ppe_required: [helmet]      # СИЗ, обязательные во всём кадре (у камеры можно переопределить)
+  min_person_height: 80       # px; людей меньше этого не проверяем на СИЗ (слишком далеко)
+  window_frames: 4            # окно сглаживания (кадров); при 2 к/с это 2 секунды
+  min_ratio: 0.6              # доля кадров окна с нарушением, после которой создаётся событие
+  vehicle_gap: 0.3            # сближение с техникой: зазор меньше 0.3 роста человека
+  cooldown_sec: 30            # новая тревога по тому же человеку и типу — только после перерыва в нарушении
+
+behavior:                     # поведение во времени (app/behavior.py)
+  pose_model: models/yolo11n-pose.pt   # скелет человека: отличить лежащего от сидящего
+  run_speed: 1.5              # бег: быстрее 1.5 роста человека в секунду
+  fall_sec: 3                 # падение: лежит дольше 3 с
+  fall_ratio: 1.15            # рамка шире высоты в 1.15 раза — кандидат в лежащие
+  lift_trunk_deg: 55          # подъём груза: спина наклонена больше 55° от вертикали...
+  lift_knee_deg: 40           # ...а колени почти прямые (сгиб меньше 40°) — поднимает спиной, а не ногами
+  lift_sec: 1.0               # держится дольше 1 с
+  lift_needs_load: false      # true — тревога, только если рядом найден груз (коробка)
+
+fire:                         # открытый огонь (app/fire.py): CLIP без обучения, тревога места — и без людей
+  enabled: true
+  weights_dir: models/weights/clip
+  threshold: 0.8              # вероятность «огонь» на кадре или его четверти
+  interval_sec: 1.0           # CLIP медленнее YOLO — проверяем раз в секунду
+
+segments:
+  seconds: 5                  # длина куска видео; кусок без нарушений удаляется, с нарушениями — сохраняется
+  min_violation_sec: 1.0      # сохранять кусок, только если нарушение видно в нём хотя бы столько
+  dir: data/clips             # сохранённые клипы (.mp4) и превью (.jpg)
+  max_total_mb: 2048          # лимит папки с клипами; при превышении удаляются самые старые
+
+tracker:
+  iou_thr: 0.3
+  max_missed: 10
+  min_hits: 2
+
+cameras:
+  # --- станочный цех: у каждого станка своё рабочее место (зона type: machine) ---
+  - id: lathe1
+    enabled: false             # выключена: сейчас работает только веб-камера
+    name: "Мехцех, токарный участок"
+    place: "Механический цех, токарный станок 16К20"
+    source: data/samples/lathe.png   # стоп-кадр; для живой камеры — rtsp://…
+    loop: true
+    fps: 2
+    image_hold_sec: 30
+    ppe_required: []          # каска в мехцехе не обязательна
+    forbid: [phone]           # телефон у станка запрещён
+    zones:
+      - name: "Рабочее место токариста"
+        type: machine
+        require: [glasses]    # стружка летит в глаза
+        forbid: [gloves]      # перчатки затягивает во вращающийся патрон
+        polygon: [[0.0, 0.0], [0.75, 0.0], [0.75, 1.0], [0.0, 1.0]]
+
+  - id: laser1
+    enabled: false             # выключена: сейчас работает только веб-камера
+    name: "Заготовительный участок"
+    place: "Заготовительный участок, лазерная резка"
+    source: data/samples/laser.png   # стоп-кадр; для живой камеры — rtsp://…
+    loop: true
+    fps: 2
+    image_hold_sec: 30
+    ppe_required: []
+    zones:
+      - name: "Пульт лазерного станка"
+        type: machine
+        require: [gloves]     # острые кромки листа после резки
+        polygon: [[0.45, 0.2], [0.85, 0.2], [0.85, 1.0], [0.45, 1.0]]
+      - name: "Стол резки"
+        type: restricted      # во время работы луча — не заходить
+        polygon: [[0.0, 0.75], [0.55, 0.75], [0.55, 1.0], [0.0, 1.0]]
+
+  - id: cnc1
+    enabled: false             # выключена: сейчас работает только веб-камера
+    name: "Участок ЧПУ"
+    place: "Участок ЧПУ, обрабатывающий центр"
+    source: data/samples/cnc.png   # стоп-кадр; для живой камеры — rtsp://…
+    loop: true
+    fps: 2
+    image_hold_sec: 30
+    ppe_required: []
+    zones:
+      - name: "Пульт ЧПУ"
+        type: machine
+        forbid: [gloves]      # шпиндель вращается; при открытой двери — опасно
+        polygon: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+
+  # --- фотоархив SH17: 65 фото работников с производств (Pexels, датасет SH17), «имитация стоп-кадров» ---
+  - id: sh17
+    enabled: false             # выключена: сейчас работает только веб-камера
+    name: "Фотоархив SH17"
+    place: "Производственные участки (фото SH17)"
+    source: data/sh17          # папка с картинками
+    loop: true
+    fps: 2
+    manual: true               # кадр выбирает оператор: ◀ ▶ или «Выбрать…» на камере
+    ppe_required: [helmet]     # на общих производственных участках каска обязательна
+    forbid: [phone]
+    zones: []
+
+  # --- демо-ролик со сценариями поведения (tools/make_scenarios_video.py): техника, бег, падение, телефон ---
+  - id: demo
+    enabled: false             # выключена: сейчас работает только веб-камера
+    name: "Сценарии поведения"
+    place: "Демо: проезд и пролёт цеха"
+    source: data/scenarios.mp4
+    loop: true
+    fps: 2
+    ppe_required: []
+    forbid: [phone]
+    zones: []
+
+  # --- твои видео: все .mp4 из data/sh17 по очереди, по кругу ---
+  - id: myvideos
+    name: "Мои видео"
+    place: "Видео пользователя (data/sh17)"
+    source: data/sh17
+    files: "*.mp4"             # плейлист: курение на балконе и второе видео
+    loop: true
+    fps: 3
+    ppe_required: []
+    forbid: [phone]
+    zones: []
+
+  # --- сценарии «открытый огонь» и «подъём груза»: кадры выбираются вручную (◀ ▶ на плитке) ---
+  - id: scenes2
+    name: "Сценарии: огонь и груз"
+    place: "Склад, участок погрузки"
+    source: data/scenarios2      # 1–2 огонь без людей; 3 правильный подъём (присед); 4, 6 работа спиной на прямых ногах; 5, 7 без нарушений
+    manual: true
+    loop: true
+    fps: 3
+    ppe_required: []
+    zones: []
+
+  # --- живая камера: веб-камера ноутбука (номер 0). Видео обрабатывается только на этом компьютере ---
+  - id: webcam
+    name: "Веб-камера (живое видео)"
+    place: "Пост оператора, живая камера"
+    source: 0
+    fps: 5                     # камера одна — можно анализировать чаще
+    ppe_required: []
+    forbid: [phone]            # возьмите телефон в руку — будет тревога
+    zones:                     # полосы для демонстрации событий 05 и 06 — их можно перерисовать в «Зонах и правилах»
+      - name: "Ограждение"
+        type: barrier          # наклонитесь корпусом в правую полосу кадра — «перелезание через ограждение»
+        polygon: [[0.82, 0.0], [1.0, 0.0], [1.0, 1.0], [0.82, 1.0]]
+      - name: "Площадка на высоте"
+        type: height           # окажитесь в левой полосе без привязи — «работа на высоте без страховки»
+        polygon: [[0.0, 0.0], [0.18, 0.0], [0.18, 1.0], [0.0, 1.0]]
+
+  # --- сетевая камера (пример): если потока нет, плитка покажет «нет сигнала», остальные работают ---
+  # - id: sklad2
+  #   name: "Склад №2, стеллажи"
+  #   place: "Склад №2, проход у стеллажей"
+  #   source: rtsp://10.0.114.27/stream1
+  #   fps: 2
+  #   ppe_required: [vest]
+  #   zones: []
+
+events:
+  db: data/incidents.db       # инциденты: место работ, время, нарушения, ссылка на клип
+
+reports:                      # автоматические отчёты по охране труда (раздел «Отчёты»)
+  credentials_file: "{desktop}/iishka_credentials.json"   # ключ Claude; приложение читает его само, при каждом отчёте
+  model: claude-opus-5-5
+  effort: medium              # low | medium | high — глубина анализа
+  max_tokens: 16000
+  timeout_sec: 180
+  dir: data/reports           # куда сохраняются отчёты (.md)
+
+notify:
+  webhook_url: null           # POST JSON с событием (например, в SCADA / MES / n8n)
+  telegram_token_env: TG_BOT_TOKEN
+  telegram_chat_id: null

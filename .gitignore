@@ -1,0 +1,31 @@
+# служебное
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# обучение и датасеты — большие, воспроизводятся tools/prepare_dataset.py и tools/train.py
+runs/
+datasets/
+weights/
+models/calib/
+
+# модели: в репозитории только обученная ppe и маленькие модели, которые нужны приложению
+models/*
+!models/ppe.pt
+!models/ppe.onnx
+!models/world_hands.pt
+!models/yolo11n.pt
+!models/yolo11n-pose.pt
+# CLIP (огонь, ~340 МБ) скачивается сам при первом запуске в models/weights/clip
+
+# данные работы приложения: журнал, клипы, кадры, личные видео, локальные настройки
+data/*
+!data/samples/
+!data/scenarios2/
+!data/scenarios.mp4
+!data/sample.jpg
+
+# ключи никогда не коммитим
+*credentials*
+*.ovpn
+.env

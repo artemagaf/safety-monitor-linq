@@ -1,0 +1,11 @@
+ultralytics>=8.3
+onnx
+onnxruntime
+onnxslim
+opencv-python
+numpy
+pyyaml
+PySide6-Essentials
+pytest
+anthropic
+git+https://github.com/openai/CLIP.git   # огонь (app/fire.py); веса ~340 МБ скачиваются при первом запуске
